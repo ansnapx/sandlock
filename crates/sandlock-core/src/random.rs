@@ -32,7 +32,11 @@ pub(crate) fn handle_getrandom(
     // Write deterministic bytes to child's buffer
     match write_child_mem(notif_fd, notif.id, notif.pid, buf_addr, &buf) {
         Ok(()) => NotifAction::ReturnValue(len as i64),
-        Err(_) => NotifAction::Continue, // fallback to real getrandom
+        Err(_) => {
+            // SECURITY FIX: Never fall back to real getrandom as it breaks determinism
+            // Return error instead of Continue to prevent bypass
+            NotifAction::Errno(libc::EFAULT)
+        }
     }
 }
 
@@ -66,9 +70,10 @@ pub(crate) fn handle_random_open(
     }
 
     // Create a memfd filled with deterministic PRNG bytes.
-    let memfd = match syscall::memfd_create("sandlock-random", 0) {
+    // SECURITY FIX: Use MFD_ALLOW_SEALING to prevent modifications
+    let memfd = match syscall::memfd_create("sandlock-random", libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC) {
         Ok(fd) => fd,
-        Err(_) => return Some(NotifAction::Continue),
+        Err(_) => return Some(NotifAction::Errno(libc::EIO)),
     };
 
     let raw = memfd.as_raw_fd();
@@ -78,9 +83,16 @@ pub(crate) fn handle_random_open(
         rng.fill_bytes(&mut buf);
         if file.write_all(&buf).is_err() || file.seek(SeekFrom::Start(0)).is_err() {
             std::mem::forget(file);
-            return Some(NotifAction::Continue);
+            return Some(NotifAction::Errno(libc::EIO));
         }
         std::mem::forget(file);
+    }
+
+    // SECURITY FIX: Seal the memfd to prevent modifications (F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK)
+    let seal_flags = libc::F_SEAL_SEAL | libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+    let ret = unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seal_flags) };
+    if ret < 0 {
+        return Some(NotifAction::Errno(libc::EIO));
     }
 
     // Move the OwnedFd into InjectFdSend — send_response will close it after the ioctl.

@@ -75,7 +75,9 @@ impl DispatchTable {
                 }
             }
         }
-        NotifAction::Continue
+        // SECURITY FIX: Deny unknown syscalls instead of allowing them
+        // This prevents bypass through unmonitored syscalls
+        NotifAction::Errno(libc::EPERM)
     }
 }
 

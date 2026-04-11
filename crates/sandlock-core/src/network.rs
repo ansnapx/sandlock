@@ -280,8 +280,10 @@ async fn connect_on_behalf(
         }
         // dup_fd dropped here, closing supervisor's copy
     } else {
-        // Non-IP family (AF_UNIX etc.) — allow through
-        NotifAction::Continue
+        // SECURITY FIX: Reject AF_UNIX sockets instead of allowing them through
+        // They can be used to bypass network restrictions via abstract sockets
+        // or system D-Bus connections
+        NotifAction::Errno(libc::EAFNOSUPPORT)
     }
 }
 
