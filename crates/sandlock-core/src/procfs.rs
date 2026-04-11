@@ -318,9 +318,10 @@ fn parse_proc_net_tcp_port(line: &str) -> Option<u16> {
 /// robust design would store it in an arena, but leaking is acceptable for
 /// the supervisor's lifetime.
 fn inject_memfd(content: &[u8]) -> NotifAction {
-    let memfd = match syscall::memfd_create("sandlock", 0) {
+    // SECURITY FIX: Use MFD_ALLOW_SEALING to allow sealing the memfd
+    let memfd = match syscall::memfd_create("sandlock", libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC) {
         Ok(fd) => fd,
-        Err(_) => return NotifAction::Continue, // fallback: let real open proceed
+        Err(_) => return NotifAction::Errno(libc::EIO),
     };
 
     // Write content and seek to start.
@@ -330,10 +331,17 @@ fn inject_memfd(content: &[u8]) -> NotifAction {
         let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
         if file.write_all(content).is_err() || file.seek(SeekFrom::Start(0)).is_err() {
             std::mem::forget(file);
-            return NotifAction::Continue;
+            return NotifAction::Errno(libc::EIO);
         }
         // Forget the File so it doesn't close the fd — memfd (OwnedFd) still owns it.
         std::mem::forget(file);
+    }
+
+    // SECURITY FIX: Seal the memfd to prevent modifications
+    let seal_flags = libc::F_SEAL_SEAL | libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+    let ret = unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seal_flags) };
+    if ret < 0 {
+        return NotifAction::Errno(libc::EIO);
     }
 
     // Move the OwnedFd into InjectFdSend — send_response will close it after the ioctl.
@@ -407,7 +415,9 @@ pub(crate) async fn handle_proc_open(
     // Virtualize /proc/meminfo.
     if path == "/proc/meminfo" && policy.max_memory_bytes > 0 {
         let rs = resource.lock().await;
-        let content = generate_meminfo(policy.max_memory_bytes, rs.mem_used);
+        // SECURITY FIX: Use atomic load for mem_used
+        let mem_used = rs.mem_used.load(std::sync::atomic::Ordering::SeqCst);
+        let content = generate_meminfo(policy.max_memory_bytes, mem_used);
         return inject_memfd(&content);
     }
 
@@ -424,7 +434,8 @@ pub(crate) async fn handle_proc_open(
         let pfs = procfs.lock().await;
         let rs = resource.lock().await;
         let total = pfs.proc_pids.len() as u32;
-        let running = rs.proc_count;
+        // SECURITY FIX: Use atomic load for proc_count
+        let running = rs.proc_count.load(std::sync::atomic::Ordering::SeqCst);
         let last_pid = pfs.proc_pids.iter().max().copied().unwrap_or(0);
         let content = generate_loadavg(&rs.load_avg, running, total, last_pid);
         return inject_memfd(&content);
@@ -637,7 +648,7 @@ pub(crate) async fn handle_sorted_getdents(
         let entries: Vec<Vec<u8>> = names
             .iter()
             .enumerate()
-            .map(|(i, (name, d_type, d_ino))| {
+            .filter_map(|(i, (name, d_type, d_ino))| {
                 build_dirent64(*d_ino, (i + 1) as i64, *d_type, name)
             })
             .collect();
@@ -692,16 +703,27 @@ pub(crate) const DT_LNK: u8 = 10;
 /// Build a single linux_dirent64 entry.
 /// struct linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[]; }
 /// d_reclen is 8-byte aligned.
-pub(crate) fn build_dirent64(d_ino: u64, d_off: i64, d_type: u8, name: &str) -> Vec<u8> {
+pub(crate) fn build_dirent64(d_ino: u64, d_off: i64, d_type: u8, name: &str) -> Option<Vec<u8>> {
+    // SECURITY FIX: Limit name length to prevent overflow
+    const MAX_NAME_LEN: usize = 255; // Linux filesystem limit
+    if name.len() > MAX_NAME_LEN {
+        return None;
+    }
+
     let name_bytes = name.as_bytes();
-    let reclen = ((19 + name_bytes.len() + 1) + 7) & !7; // +1 NUL, align to 8
+    // Use checked arithmetic to prevent overflow
+    let reclen = (19usize + name_bytes.len() + 1).checked_add(7)? & !7;
+    if reclen > 4096 { // Reasonable upper limit for dirent
+        return None;
+    }
+
     let mut buf = vec![0u8; reclen];
     buf[0..8].copy_from_slice(&d_ino.to_ne_bytes());
     buf[8..16].copy_from_slice(&d_off.to_ne_bytes());
     buf[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
     buf[18] = d_type;
     buf[19..19 + name_bytes.len()].copy_from_slice(name_bytes);
-    buf
+    Some(buf)
 }
 
 /// Build a filtered list of dirent64 entries for /proc, hiding PIDs not in the sandbox.
@@ -742,7 +764,9 @@ fn build_filtered_dirents(sandbox_pids: &HashSet<i32>) -> Vec<Vec<u8>> {
             entry.metadata().map(|m| m.st_ino()).unwrap_or(0)
         };
 
-        entries.push(build_dirent64(d_ino, d_off, d_type, &name_str));
+        if let Some(entry) = build_dirent64(d_ino, d_off, d_type, &name_str) {
+            entries.push(entry);
+        }
     }
     entries
 }
@@ -1064,7 +1088,7 @@ mod tests {
 
     #[test]
     fn test_build_dirent64() {
-        let entry = build_dirent64(12345, 1, DT_DIR, "1234");
+        let entry = build_dirent64(12345, 1, DT_DIR, "1234").expect("build_dirent64 should succeed");
         assert_eq!(entry.len(), 24); // 19 + 5 = 24, already aligned
         let d_ino = u64::from_ne_bytes(entry[0..8].try_into().unwrap());
         assert_eq!(d_ino, 12345);
@@ -1077,7 +1101,7 @@ mod tests {
 
     #[test]
     fn test_build_dirent64_alignment() {
-        let entry = build_dirent64(1, 1, DT_REG, "ab");
+        let entry = build_dirent64(1, 1, DT_REG, "ab").expect("build_dirent64 should succeed");
         // 19 + 3 = 22, padded to 24
         assert_eq!(entry.len(), 24);
     }

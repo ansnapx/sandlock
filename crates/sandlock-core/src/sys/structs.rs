@@ -295,6 +295,25 @@ pub const DEFAULT_DENY_SYSCALLS: &[&str] = &[
     "io_uring_enter",
     "io_uring_register",
     "personality",
+    // SECURITY FIX: Add IPC syscalls to prevent sandbox escape via message queues
+    "msgget",
+    "msgsnd",
+    "msgrcv",
+    "msgctl",
+    "semget",
+    "semop",
+    "semctl",
+    "semtimedop",
+    "shmget",
+    "shmat",
+    "shmctl",
+    "shmdt",
+    "mq_open",
+    "mq_unlink",
+    "mq_timedsend",
+    "mq_timedreceive",
+    "mq_notify",
+    "mq_getsetattr",
 ];
 
 /// Deny list for --no-supervisor mode.

@@ -234,6 +234,9 @@ pub fn notif_syscalls(policy: &Policy) -> Vec<u32> {
         libc::SYS_clone as u32,
         libc::SYS_clone3 as u32,
         libc::SYS_vfork as u32,
+        // SECURITY FIX: Add fork() syscall to prevent bypass
+        // fork(2) is syscall 57 on x86_64, distinct from clone
+        57u32, // SYS_fork on x86_64
         libc::SYS_wait4 as u32,
         libc::SYS_waitid as u32,
     ];
@@ -851,7 +854,10 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     if nested {
         // Nested sandbox: deny-only filter (no supervisor — parent handles it).
         // BPF filters are ANDed by the kernel, so each level can only tighten.
-        let filter = bpf::assemble_filter(&[], &deny, &args);
+        let filter = match bpf::assemble_filter(&[], &deny, &args) {
+            Ok(f) => f,
+            Err(e) => fail!(format!("seccomp assemble filter: {}", e)),
+        };
         if let Err(e) = bpf::install_deny_filter(&filter) {
             fail!(format!("seccomp deny filter: {}", e));
         }
@@ -862,7 +868,10 @@ pub(crate) fn confine_child(policy: &Policy, cmd: &[CString], pipes: &PipePair, 
     } else {
         // First-level sandbox: notif + deny filter with NEW_LISTENER.
         let notif = notif_syscalls(policy);
-        let filter = bpf::assemble_filter(&notif, &deny, &args);
+        let filter = match bpf::assemble_filter(&notif, &deny, &args) {
+            Ok(f) => f,
+            Err(e) => fail!(format!("seccomp assemble filter: {}", e)),
+        };
         let notif_fd = match bpf::install_filter(&filter) {
             Ok(fd) => fd,
             Err(e) => fail!(format!("seccomp install: {}", e)),

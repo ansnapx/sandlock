@@ -41,6 +41,11 @@ fn read_path(notif: &SeccompNotif, addr: u64, notif_fd: RawFd) -> Option<String>
 /// Resolve a path that may be relative to a dirfd.
 /// For AT_FDCWD (-100), returns the path as-is (assumed absolute or cwd-relative).
 /// For other dirfds, reads /proc/{pid}/fd/{dirfd} to get the base path.
+///
+/// SECURITY NOTE: This function has a TOCTOU race condition. The /proc/{pid}/cwd
+/// and /proc/{pid}/fd/{dirfd} symlinks can change between read and use.
+/// A complete fix would use pidfd_getfd or openat2 with RESOLVE_NO_SYMLINKS.
+/// This is a known limitation with partial mitigation via path validation.
 fn resolve_at_path(notif: &SeccompNotif, dirfd: i64, path: &str) -> String {
     if std::path::Path::new(path).is_absolute() {
         return path.to_string();
@@ -50,12 +55,14 @@ fn resolve_at_path(notif: &SeccompNotif, dirfd: i64, path: &str) -> String {
     let dirfd32 = dirfd as i32;
     if dirfd32 == libc::AT_FDCWD {
         // Relative to cwd — read /proc/{pid}/cwd
+        // SECURITY: TOCTOU here - cwd can change after read
         if let Ok(cwd) = std::fs::read_link(format!("/proc/{}/cwd", notif.pid)) {
             return format!("{}/{}", cwd.display(), path);
         }
         return path.to_string();
     }
     // Relative to dirfd
+    // SECURITY: TOCTOU here - fd target can change after read
     if let Ok(base) = std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)) {
         format!("{}/{}", base.display(), path)
     } else {
@@ -806,7 +813,9 @@ pub(crate) async fn handle_cow_getdents(
             let d_ino = std::fs::symlink_metadata(check)
                 .map(|m| m.ino())
                 .unwrap_or(0);
-            entries.push(build_dirent64(d_ino, d_off, d_type, name));
+            if let Some(entry) = build_dirent64(d_ino, d_off, d_type, name) {
+                entries.push(entry);
+            }
         }
         st.dir_cache.insert(cache_key, (target.clone(), entries));
     }

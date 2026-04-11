@@ -2,15 +2,16 @@
 // handlers only contend on the state they actually need.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Resource-limit runtime state shared across notification handlers.
 pub struct ResourceState {
     /// Live concurrent process count — incremented on fork, decremented on wait.
-    pub proc_count: u32,
+    pub proc_count: AtomicU32,
     /// Maximum allowed concurrent processes.
     pub max_processes: u32,
     /// Estimated anonymous memory usage (bytes).
-    pub mem_used: u64,
+    pub mem_used: AtomicU64,
     /// Maximum allowed anonymous memory (bytes).
     pub max_memory_bytes: u64,
     /// Per-PID brk base addresses for memory tracking.
@@ -29,9 +30,9 @@ impl ResourceState {
     /// Create a new resource state with the given limits.
     pub fn new(max_memory_bytes: u64, max_processes: u32) -> Self {
         Self {
-            proc_count: 0,
+            proc_count: AtomicU32::new(0),
             max_processes,
-            mem_used: 0,
+            mem_used: AtomicU64::new(0),
             max_memory_bytes,
             brk_bases: HashMap::new(),
             hold_forks: false,

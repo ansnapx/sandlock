@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::BranchError;
 
@@ -81,7 +82,8 @@ pub struct SeccompCowBranch {
     has_changes: bool,
     finished: bool,
     max_disk_bytes: u64,
-    disk_used: u64,
+    // SECURITY FIX: Use atomic for disk_used to prevent TOCTOU race
+    disk_used: AtomicU64,
 }
 
 impl SeccompCowBranch {
@@ -111,7 +113,7 @@ impl SeccompCowBranch {
             has_changes: false,
             finished: false,
             max_disk_bytes,
-            disk_used: 0,
+            disk_used: AtomicU64::new(0),
         })
     }
 
@@ -180,11 +182,12 @@ impl SeccompCowBranch {
     /// already exhausted, don't allow any new allocations".
     fn check_quota(&self, additional: u64) -> Result<(), BranchError> {
         if self.max_disk_bytes > 0 {
+            let current = self.disk_used.load(Ordering::SeqCst);
             if additional == 0 {
-                if self.disk_used >= self.max_disk_bytes {
+                if current >= self.max_disk_bytes {
                     return Err(BranchError::QuotaExceeded);
                 }
-            } else if self.disk_used + additional > self.max_disk_bytes {
+            } else if current + additional > self.max_disk_bytes {
                 return Err(BranchError::QuotaExceeded);
             }
         }
@@ -193,7 +196,8 @@ impl SeccompCowBranch {
 
     /// Recalculate `disk_used` by walking the upper directory.
     fn recalc_disk_used(&mut self) {
-        self.disk_used = dir_size(&self.upper);
+        let size = dir_size(&self.upper);
+        self.disk_used.store(size, Ordering::SeqCst);
     }
 
     /// Prepare a COW copy: update metadata (deleted set, quota reservation)
@@ -223,7 +227,7 @@ impl SeccompCowBranch {
                 .map_err(|e| BranchError::Operation(format!("readlink: {}", e)))?;
             std::os::unix::fs::symlink(&target, &upper_file)
                 .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
-            self.disk_used += 256;
+            self.disk_used.fetch_add(256, Ordering::SeqCst);
             return Ok(CowCopyPlan::Ready(upper_file));
         }
 
@@ -235,7 +239,7 @@ impl SeccompCowBranch {
             if let Ok(meta) = lower_file.metadata() {
                 let _ = fs::set_permissions(&upper_file, meta.permissions());
             }
-            self.disk_used += 4096;
+            self.disk_used.fetch_add(4096, Ordering::SeqCst);
             return Ok(CowCopyPlan::Ready(upper_file));
         }
 
@@ -245,7 +249,7 @@ impl SeccompCowBranch {
                 .map_err(|e| BranchError::Operation(format!("metadata: {}", e)))?;
             let file_size = meta.len();
             self.check_quota(file_size)?;
-            self.disk_used += file_size;
+            self.disk_used.fetch_add(file_size, Ordering::SeqCst);
             return Ok(CowCopyPlan::NeedsCopy {
                 upper: upper_file,
                 lower: lower_file,
@@ -446,7 +450,9 @@ impl SeccompCowBranch {
 
     /// Roll back quota reservation if the copy failed.
     pub fn rollback_copy(&mut self, file_size: u64) {
-        self.disk_used = self.disk_used.saturating_sub(file_size);
+        let current = self.disk_used.load(Ordering::SeqCst);
+        let new = current.saturating_sub(file_size);
+        self.disk_used.store(new, Ordering::SeqCst);
     }
 
     /// Handle unlink/rmdir.
@@ -515,7 +521,7 @@ impl SeccompCowBranch {
         let upper_dir = self.upper.join(&rel);
         let ok = fs::create_dir_all(&upper_dir).is_ok();
         if ok {
-            self.disk_used += 4096;
+            self.disk_used.fetch_add(4096, Ordering::SeqCst);
         }
         Ok(ok)
     }
@@ -581,7 +587,7 @@ impl SeccompCowBranch {
         }
         let ok = std::os::unix::fs::symlink(target, &upper_link).is_ok();
         if ok {
-            self.disk_used += 256;
+            self.disk_used.fetch_add(256, Ordering::SeqCst);
         }
         Ok(ok)
     }
@@ -659,9 +665,11 @@ impl SeccompCowBranch {
         let ok = file.set_len(new_len).is_ok();
         if ok {
             if new_len > old_len {
-                self.disk_used += new_len - old_len;
+                self.disk_used.fetch_add(new_len - old_len, Ordering::SeqCst);
             } else {
-                self.disk_used = self.disk_used.saturating_sub(old_len - new_len);
+                let current = self.disk_used.load(Ordering::SeqCst);
+                let new = current.saturating_sub(old_len - new_len);
+                self.disk_used.store(new, Ordering::SeqCst);
             }
         }
         Ok(ok)
