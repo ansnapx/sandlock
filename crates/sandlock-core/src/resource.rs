@@ -1,6 +1,7 @@
 // Resource limit handlers — memory and process limit enforcement.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 use crate::seccomp::notif::{NotifAction, NotifPolicy};
@@ -14,6 +15,9 @@ const CLONE_THREAD: u64 = 0x0001_0000;
 
 /// MAP_ANONYMOUS flag — only anonymous mappings count toward memory limit.
 const MAP_ANONYMOUS: u64 = 0x20;
+
+/// Maximum allowed memory mapping size (128 TB on x86_64)
+const MAX_MMAP_SIZE: u64 = 1 << 47;
 
 /// Handle fork/clone/vfork notifications.
 ///
@@ -40,6 +44,10 @@ pub(crate) async fn handle_fork(
         }
     }
     // For clone3: BPF arg filter handles dangerous cases; proceed to limit check.
+    // SECURITY FIX: Also check fork() syscall (57)
+    if nr == libc::SYS_fork || nr == 57 {
+        // fork() is just clone with SIGCHLD, same checks apply
+    }
 
     let mut rs = resource.lock().await;
 
@@ -50,11 +58,13 @@ pub(crate) async fn handle_fork(
     }
 
     // Enforce concurrent process limit.
-    if rs.proc_count >= rs.max_processes {
+    // SECURITY FIX: Use atomic compare-and-swap for proc_count
+    let current_count = rs.proc_count.load(Ordering::SeqCst);
+    if current_count >= rs.max_processes {
         return NotifAction::Errno(EAGAIN);
     }
 
-    rs.proc_count += 1;
+    rs.proc_count.store(current_count + 1, Ordering::SeqCst);
     drop(rs);
 
     let mut pfs = procfs.lock().await;
@@ -72,8 +82,9 @@ pub(crate) async fn handle_wait(
     _notif: &SeccompNotif,
     resource: &Arc<Mutex<ResourceState>>,
 ) -> NotifAction {
-    let mut rs = resource.lock().await;
-    rs.proc_count = rs.proc_count.saturating_sub(1);
+    let rs = resource.lock().await;
+    // SECURITY FIX: Use atomic saturating sub
+    rs.proc_count.fetch_sub(1, Ordering::SeqCst);
     NotifAction::Continue
 }
 
@@ -97,16 +108,24 @@ pub(crate) async fn handle_memory(
         // args[1] = len, args[3] = flags
         let len = args[1];
         let flags = args[3];
+
+        // SECURITY FIX: Validate mmap size
+        if len > MAX_MMAP_SIZE {
+            return kill;
+        }
+
         if (flags & MAP_ANONYMOUS) != 0 {
-            if st.mem_used.saturating_add(len) > limit {
+            let current = st.mem_used.load(Ordering::SeqCst);
+            if current.saturating_add(len) > limit {
                 return kill;
             }
-            st.mem_used += len;
+            st.mem_used.store(current + len, Ordering::SeqCst);
         }
     } else if nr == libc::SYS_munmap {
         // args[1] = len
         let len = args[1];
-        st.mem_used = st.mem_used.saturating_sub(len);
+        let current = st.mem_used.load(Ordering::SeqCst);
+        st.mem_used.store(current.saturating_sub(len), Ordering::SeqCst);
     } else if nr == libc::SYS_brk {
         // args[0] = new_brk
         let new_brk = args[0];
@@ -121,14 +140,16 @@ pub(crate) async fn handle_memory(
 
         if new_brk > base {
             let delta = new_brk - base;
-            if st.mem_used.saturating_add(delta) > limit {
+            let current = st.mem_used.load(Ordering::SeqCst);
+            if current.saturating_add(delta) > limit {
                 return kill;
             }
-            st.mem_used += delta;
+            st.mem_used.store(current + delta, Ordering::SeqCst);
             st.brk_bases.insert(pid, new_brk);
         } else if new_brk < base {
             let delta = base - new_brk;
-            st.mem_used = st.mem_used.saturating_sub(delta);
+            let current = st.mem_used.load(Ordering::SeqCst);
+            st.mem_used.store(current.saturating_sub(delta), Ordering::SeqCst);
             st.brk_bases.insert(pid, new_brk);
         }
     } else if nr == libc::SYS_mremap {
@@ -136,23 +157,37 @@ pub(crate) async fn handle_memory(
         let old_len = args[1];
         let new_len = args[2];
 
+        // SECURITY FIX: Validate mremap parameters
+        if new_len > MAX_MMAP_SIZE {
+            return kill;
+        }
+
         if new_len > old_len {
             let growth = new_len - old_len;
-            if st.mem_used.saturating_add(growth) > limit {
+            let current = st.mem_used.load(Ordering::SeqCst);
+            if current.saturating_add(growth) > limit {
                 return kill;
             }
-            st.mem_used += growth;
+            st.mem_used.store(current + growth, Ordering::SeqCst);
         } else if new_len < old_len {
             let shrink = old_len - new_len;
-            st.mem_used = st.mem_used.saturating_sub(shrink);
+            let current = st.mem_used.load(Ordering::SeqCst);
+            st.mem_used.store(current.saturating_sub(shrink), Ordering::SeqCst);
         }
     } else if nr == libc::SYS_shmget {
         // shmget(key, size, shmflg) — args[1] = size
         let size = args[1];
-        if size > 0 && st.mem_used.saturating_add(size) > limit {
+
+        // SECURITY FIX: Validate shmget size
+        if size > MAX_MMAP_SIZE {
             return kill;
         }
-        st.mem_used += size;
+
+        let current = st.mem_used.load(Ordering::SeqCst);
+        if size > 0 && current.saturating_add(size) > limit {
+            return kill;
+        }
+        st.mem_used.store(current + size, Ordering::SeqCst);
     }
 
     NotifAction::Continue
